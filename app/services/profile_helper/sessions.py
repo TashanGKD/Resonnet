@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import time
@@ -132,16 +133,31 @@ def _new_session(session_id: str, user_id: int | str | None = None) -> dict:
             forum_profile_path = str(ff)
         if sf.exists():
             try:
-                import json
-
                 scales = json.loads(sf.read_text(encoding="utf-8"))
             except Exception:
                 scales = {}
+    else:
+        # 匿名用户：按 session_id 前 8 位查找已有 profile 文件
+        # 文件命名规则：{identifier}-{sid[:8]}.md（见 _target_profile_path）
+        sid_suffix = session_id.replace("-", "")[:8]
+        anon_dir = _profiles_dir(None)
+        if anon_dir.exists():
+            profile_matches = sorted(anon_dir.glob(f"*-{sid_suffix}.md"))
+            if profile_matches:
+                profile = profile_matches[0].read_text(encoding="utf-8")
+                profile_path = str(profile_matches[0])
+            forum_matches = sorted(anon_dir.glob(f"*-{sid_suffix}-论坛画像.md"))
+            if forum_matches:
+                forum_profile = forum_matches[0].read_text(encoding="utf-8")
+                forum_profile_path = str(forum_matches[0])
+
+    # 从磁盘恢复消息历史（AI 续接对话的关键）
+    messages = load_messages(session_id, user_id=user_id)
 
     return {
         "session_id": session_id,
         "user_id": user_id,
-        "messages": [],
+        "messages": messages,
         "profile": profile,
         "forum_profile": forum_profile,
         "profile_path": profile_path,
@@ -225,14 +241,53 @@ def save_forum_profile(session: dict, content: str) -> Path:
     return target_path
 
 
+def _messages_path(session: dict) -> Path:
+    """返回该 session 的消息历史文件路径。"""
+    user_id = session.get("user_id")
+    if user_id:
+        return _profiles_dir(user_id) / "messages.json"
+    sid = _session_suffix(session)
+    anon_dir = _profiles_dir(None)
+    anon_dir.mkdir(parents=True, exist_ok=True)
+    return anon_dir / f"messages-{sid}.json"
+
+
+def save_messages(session: dict) -> None:
+    """将 session.messages 持久化到磁盘（每次 run_block_agent 后调用）。"""
+    path = _messages_path(session)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # 保留 user/assistant/tool 三种角色，确保 AI 续接时有完整上下文
+    storable = [
+        m for m in session.get("messages", [])
+        if m.get("role") in ("user", "assistant", "tool")
+    ]
+    path.write_text(
+        json.dumps(storable, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+def load_messages(session_id: str, user_id=None) -> list:
+    """在 session 重建时尝试从磁盘恢复消息历史。"""
+    if user_id:
+        path = _profiles_dir(user_id) / "messages.json"
+    else:
+        sid = session_id.replace("-", "")[:8]
+        path = _profiles_dir(None) / f"messages-{sid}.json"
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+    return []
+
+
 def _sync_twin_agent(session: dict) -> None:
     """When forum profile exists, auto-generate user's my_twin agent files."""
     user_id = session.get("user_id")
     forum_content = session.get("forum_profile", "")
     if not user_id or not forum_content:
         return
-
-    import json as _json
 
     twin_dir = get_user_agents_dir(user_id) / "my_twin"
     twin_dir.mkdir(parents=True, exist_ok=True)
@@ -242,7 +297,7 @@ def _sync_twin_agent(session: dict) -> None:
     existing_meta = {}
     if meta_path.exists():
         try:
-            existing_meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+            existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except Exception:
             existing_meta = {}
 
@@ -260,7 +315,32 @@ def _sync_twin_agent(session: dict) -> None:
         "created_at": existing_meta.get("created_at", date.today().strftime("%Y-%m-%d")),
         "updated_at": date.today().strftime("%Y-%m-%d"),
     }
-    meta_path.write_text(_json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _migrate_anon_to_user(session: dict, user_id: int | str) -> None:
+    """将匿名 session 的画像和消息迁移到用户专属目录，并更新 session.user_id。"""
+    pdir = _profiles_dir(user_id)
+    pdir.mkdir(parents=True, exist_ok=True)
+
+    # 迁移画像文件
+    profile_content = session.get("profile", "")
+    if profile_content and profile_content != _load_template_with_date():
+        target = pdir / "profile.md"
+        if not target.exists():
+            target.write_text(profile_content, encoding="utf-8")
+            session["profile_path"] = str(target)
+
+    # 迁移消息历史
+    msgs = session.get("messages", [])
+    if msgs:
+        messages_path = pdir / "messages.json"
+        if not messages_path.exists():
+            messages_path.write_text(json.dumps(msgs, ensure_ascii=False), encoding="utf-8")
+
+    # 更新 session 的 user_id
+    session["user_id"] = user_id
+    _touch(session)
 
 
 def get_or_create(
@@ -273,7 +353,8 @@ def get_or_create(
         s = _sessions[session_id]
         s["session_id"] = session_id
         if user_id and not s.get("user_id"):
-            s["user_id"] = user_id
+            # 用户刚登录，之前是匿名 session → 触发迁移
+            _migrate_anon_to_user(s, user_id)
         if "forum_profile" not in s:
             s["forum_profile"] = ""
         if "profile_path" not in s:
@@ -292,8 +373,6 @@ def get_or_create(
 
 def save_scales(session: dict, scale_name: str, data: dict) -> None:
     """Save scale results to session and disk."""
-    import json
-
     if "scales" not in session:
         session["scales"] = {}
     data["completed_at"] = date.today().strftime("%Y-%m-%d")

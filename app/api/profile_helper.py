@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from app.api.auth_bridge import get_current_auth_context
 from app.integrations.account_sync import sync_twin_record
 from app.services.profile_helper import agent as profile_agent
+from app.services.profile_helper import block_agent as profile_block_agent
 from app.services.profile_helper import sessions as profile_sessions
 
 router = APIRouter()
@@ -57,7 +58,9 @@ def _normalize_session_id(session_id: str | None) -> str | None:
 def _get_session_for_user(session_id: str, uid: str) -> dict:
     session = profile_sessions.get(session_id)
     if not session:
-        raise HTTPException(status_code=404, detail="会话不存在或已过期")
+        # 会话不在内存中（常见于 uvicorn --reload 后热重载导致内存清空）
+        # 尝试用 get_or_create 从磁盘恢复画像文件
+        _, session = profile_sessions.get_or_create(session_id, user_id=uid)
 
     existing_uid = session.get("user_id")
     if existing_uid and str(existing_uid) != str(uid):
@@ -209,6 +212,46 @@ async def chat_stream(
     )
 
 
+@router.post("/chat/blocks", response_class=StreamingResponse)
+async def chat_blocks_stream(
+    req: ChatRequest,
+    auth_ctx: dict = Depends(get_current_auth_context),
+):
+    """Block 协议 SSE：每个 Block 作为一条 SSE 事件发送。"""
+    uid = _get_uid(auth_ctx)
+    normalized_session_id = _normalize_session_id(req.session_id)
+    session_id, session = profile_sessions.get_or_create(
+        normalized_session_id,
+        user_id=uid,
+    )
+    if not req.message.strip():
+        raise HTTPException(status_code=400, detail="消息不能为空")
+
+    def generate():
+        try:
+            blocks = profile_block_agent.run_block_agent(
+                req.message, session, model=req.model
+            )
+            # 每轮对话结束后立即将消息历史持久化到磁盘
+            # 确保 session 过期后仍可从磁盘恢复 AI 上下文
+            profile_sessions.save_messages(session)
+            for block in blocks:
+                yield f"data: {json.dumps(block, ensure_ascii=False)}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'text', 'content': f'服务器错误: {e}'}, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Session-Id": session_id,
+        },
+    )
+
+
 @router.get("/profile/{session_id}")
 async def get_profile(
     session_id: str,
@@ -223,6 +266,64 @@ async def get_profile(
     }
 
 
+@router.get("/chat-history/{session_id}")
+async def get_chat_history(
+    session_id: str,
+    auth_ctx: dict = Depends(get_current_auth_context),
+):
+    """返回 session 的用户可见对话历史（过滤 tool 角色，保留 user/assistant 可读消息）。"""
+    uid = _get_uid(auth_ctx)
+    normalized = _normalize_session_id(session_id)
+    session = _get_session_for_user(normalized, uid)
+
+    # 优先从内存 session 读取；内存中没有则从磁盘恢复
+    raw_messages = session.get("messages") or profile_sessions.load_messages(normalized, uid)
+
+    # 只保留用户可读的消息（user 角色 + 有文字内容的 assistant 角色）
+    visible: list[dict] = []
+    for m in raw_messages:
+        role = m.get("role")
+        if role == "user":
+            content = m.get("content", "")
+            if content:
+                visible.append({"role": "user", "content": content})
+        elif role == "assistant":
+            content = m.get("content", "")
+            # 跳过纯工具调用中转消息（content 为空或仅是系统桥接短文本）
+            if content and len(content) > 5 and not content.startswith("（"):
+                visible.append({"role": "assistant", "content": content})
+
+    return {"messages": visible, "count": len(visible)}
+
+
+@router.get("/profile/{session_id}/scientists/famous")
+async def get_famous_scientists(
+    session_id: str,
+    auth_ctx: dict = Depends(get_current_auth_context),
+):
+    """知名科学家相似度匹配（纯计算，瞬间返回）。"""
+    uid = _get_uid(auth_ctx)
+    session = _get_session_for_user(session_id, uid)
+    from app.services.profile_helper.profile_parser import parse_profile
+    from app.services.profile_helper.scientist_match import match_famous_scientists
+    parsed = parse_profile(session["profile"])
+    return match_famous_scientists(parsed)
+
+
+@router.get("/profile/{session_id}/scientists/field")
+async def get_field_scientist_recommendations(
+    session_id: str,
+    auth_ctx: dict = Depends(get_current_auth_context),
+):
+    """领域相关科学家推荐（LLM 调用，可能较慢）。"""
+    uid = _get_uid(auth_ctx)
+    session = _get_session_for_user(session_id, uid)
+    from app.services.profile_helper.profile_parser import parse_profile
+    from app.services.profile_helper.scientist_match import recommend_field_scientists
+    parsed = parse_profile(session["profile"])
+    return {"recommendations": recommend_field_scientists(parsed)}
+
+
 @router.get("/profile/{session_id}/structured")
 async def get_structured_profile(
     session_id: str,
@@ -233,32 +334,6 @@ async def get_structured_profile(
     from app.services.profile_helper.profile_parser import parse_profile
 
     return parse_profile(session["profile"])
-
-
-@router.get("/profile/{session_id}/scientists/famous")
-async def get_famous_scientist_matches(
-    session_id: str,
-    auth_ctx: dict = Depends(get_current_auth_context),
-):
-    """Top famous-scientist matches + scatter plot data (placeholder until matcher is wired)."""
-    uid = _get_uid(auth_ctx)
-    _ = _get_session_for_user(session_id, uid)
-    return {
-        "top3": [],
-        "scatter_data": [],
-        "user_point": {"csi": 0.5, "rai": 0.5},
-    }
-
-
-@router.get("/profile/{session_id}/scientists/field")
-async def get_field_scientist_recommendations(
-    session_id: str,
-    auth_ctx: dict = Depends(get_current_auth_context),
-):
-    """Same-field scholar recommendations (placeholder until recommender is wired)."""
-    uid = _get_uid(auth_ctx)
-    _ = _get_session_for_user(session_id, uid)
-    return {"recommendations": []}
 
 
 @router.get("/download/{session_id}")
@@ -428,8 +503,6 @@ async def publish_to_library(
         "visibility": req.visibility,
         "exposure": req.exposure,
         "sync_status": sync_result.get("status", "unknown"),
-        "twin_id": sync_result.get("twin_id"),
-        "twin_version": sync_result.get("twin_version"),
     }
 
 
