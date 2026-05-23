@@ -8,6 +8,25 @@ set -e
 cd "$(dirname "$0")/.."
 BASE_URL="${BASE_URL:-http://localhost:8000}"
 
+BASE_HOST="$(python3 - "$BASE_URL" <<'PY'
+import sys
+from urllib.parse import urlparse
+
+print((urlparse(sys.argv[1]).hostname or "").lower())
+PY
+)"
+case "$BASE_HOST" in
+  ""|localhost|127.0.0.1|::1|*.local)
+    ;;
+  *)
+    if [[ "${BACKEND_DOCKER_API_ALLOW_REMOTE_WRITES:-0}" != "1" ]]; then
+      echo "Refusing to run write API tests against non-local BASE_URL=$BASE_URL" >&2
+      echo "Set BACKEND_DOCKER_API_ALLOW_REMOTE_WRITES=1 only for an intentional remote test." >&2
+      exit 1
+    fi
+    ;;
+esac
+
 # Ensure .env exists for docker-compose (app requires ANTHROPIC_* and AI_GENERATION_* at startup)
 if [[ ! -f .env ]]; then
   echo "Creating minimal .env for Docker (app won't call real APIs with placeholder keys)..."
