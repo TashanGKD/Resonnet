@@ -1,6 +1,9 @@
 ARG PYTHON_BASE_IMAGE=python:3.11-slim
 FROM ${PYTHON_BASE_IMAGE}
 
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
+ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
+
 # 创建非 root 用户
 RUN useradd -m -u 1000 appuser
 
@@ -22,11 +25,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get autoremove -y \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# 配置 pip 使用阿里云镜像源，加速下载
+# 配置 pip 下载源；CI 和海外部署可通过 build args 切换到官方 PyPI。
 RUN mkdir -p /home/appuser/.pip && \
     echo "[global]" > /home/appuser/.pip/pip.conf && \
-    echo "index-url = https://mirrors.aliyun.com/pypi/simple/" >> /home/appuser/.pip/pip.conf && \
-    echo "trusted-host = mirrors.aliyun.com" >> /home/appuser/.pip/pip.conf && \
+    echo "index-url = ${PIP_INDEX_URL}" >> /home/appuser/.pip/pip.conf && \
+    echo "trusted-host = ${PIP_TRUSTED_HOST}" >> /home/appuser/.pip/pip.conf && \
     echo "timeout = 300" >> /home/appuser/.pip/pip.conf && \
     echo "retries = 10" >> /home/appuser/.pip/pip.conf
 
@@ -42,7 +45,7 @@ USER appuser
 # 添加用户本地 bin 目录到 PATH
 ENV PATH="/home/appuser/.local/bin:$PATH"
 
-# 安装依赖（使用阿里云镜像源）
+# 安装依赖（使用构建时选择的镜像源）
 RUN for i in 1 2 3; do pip install --no-cache-dir -e . && break || { echo "pip attempt $i failed, retrying in 20s..."; sleep 20; }; done
 
 EXPOSE 8000
