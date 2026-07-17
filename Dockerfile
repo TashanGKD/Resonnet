@@ -3,6 +3,8 @@ FROM ${PYTHON_BASE_IMAGE}
 
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
+ARG PIP_TIMEOUT=120
+ARG PIP_RETRIES=3
 
 # 创建非 root 用户
 RUN useradd -m -u 1000 appuser
@@ -30,8 +32,8 @@ RUN mkdir -p /home/appuser/.pip && \
     echo "[global]" > /home/appuser/.pip/pip.conf && \
     echo "index-url = ${PIP_INDEX_URL}" >> /home/appuser/.pip/pip.conf && \
     echo "trusted-host = ${PIP_TRUSTED_HOST}" >> /home/appuser/.pip/pip.conf && \
-    echo "timeout = 300" >> /home/appuser/.pip/pip.conf && \
-    echo "retries = 10" >> /home/appuser/.pip/pip.conf
+    echo "timeout = ${PIP_TIMEOUT}" >> /home/appuser/.pip/pip.conf && \
+    echo "retries = ${PIP_RETRIES}" >> /home/appuser/.pip/pip.conf
 
 # 复制代码并修改所有权
 COPY . .
@@ -46,7 +48,12 @@ USER appuser
 ENV PATH="/home/appuser/.local/bin:$PATH"
 
 # 安装依赖（使用构建时选择的镜像源）
-RUN for i in 1 2 3; do pip install --no-cache-dir -e . && break || { echo "pip attempt $i failed, retrying in 20s..."; sleep 20; }; done
+RUN for i in 1 2 3; do \
+      pip install --no-cache-dir -e . && exit 0; \
+      echo "pip attempt $i failed, retrying in 20s..."; \
+      sleep 20; \
+    done; \
+    exit 1
 
 EXPOSE 8000
 
