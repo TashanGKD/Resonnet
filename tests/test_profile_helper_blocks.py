@@ -151,9 +151,9 @@ def test_sb_b07_multiple_interactive_blocks_intercepted(isolated_workspace, monk
     session["messages"].append({"role": "user", "content": "hello"})
     session["messages"].append({"role": "assistant", "content": "欢迎"})
 
-    with patch.object(ba, "create_client") as mock_client_fn:
+    with patch.object(ba, "get_client_with_rotation") as mock_client_fn:
         mock_client = MagicMock()
-        mock_client_fn.return_value = mock_client
+        mock_client_fn.return_value = (mock_client, "test-key")
         mock_client.chat.completions.create.return_value = _fake_create()
 
         blocks = ba.run_block_agent("直接开始填写", session)
