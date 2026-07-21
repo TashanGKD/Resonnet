@@ -1,5 +1,5 @@
-ARG PYTHON_BASE_IMAGE=python:3.11-slim
-ARG NODE_BASE_IMAGE=node:20-slim
+ARG PYTHON_BASE_IMAGE=docker.m.daocloud.io/library/python:3.11-slim
+ARG NODE_BASE_IMAGE=docker.m.daocloud.io/library/node:20-slim
 FROM ${NODE_BASE_IMAGE} AS node-runtime
 FROM ${PYTHON_BASE_IMAGE}
 
@@ -7,14 +7,16 @@ ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
 ARG PIP_TRUSTED_HOST=mirrors.aliyun.com
 ARG PIP_TIMEOUT=120
 ARG PIP_RETRIES=3
+ARG APT_MIRROR=http://mirrors.aliyun.com/debian
+ARG APT_SECURITY_MIRROR=http://mirrors.aliyun.com/debian-security
+ARG NPM_REGISTRY=https://registry.npmmirror.com
 
 # 创建非 root 用户
 RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-# 复用官方 Node 镜像中的运行时，避免通过 NodeSource 下载 Node.js。
-# 生产环境的代理链路较慢，大包下载容易长时间占满部署主机。
+# 复用 Node 镜像中的运行时，避免通过 NodeSource 下载 Node.js。
 COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
 COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
@@ -23,17 +25,25 @@ RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
 
 # 安装 sandbox-runtime (srt) 运行时依赖
 # srt 在 Linux 上需要: bubblewrap, socat, ripgrep
-RUN printf '%s\n' \
+RUN for source_file in /etc/apt/sources.list /etc/apt/sources.list.d/debian.sources; do \
+      [ ! -f "$source_file" ] || sed -i \
+        -e "s|https\?://deb.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
+        -e "s|https\?://security.debian.org/debian-security|${APT_SECURITY_MIRROR}|g" \
+        -e "s|https\?://deb.debian.org/debian|${APT_MIRROR}|g" \
+        "$source_file"; \
+    done && \
+    printf '%s\n' \
         'Acquire::Retries "5";' \
         'Acquire::http::Pipeline-Depth "0";' \
         'Acquire::http::Timeout "30";' \
         'Acquire::https::Timeout "30";' \
-        > /etc/apt/apt.conf.d/80-topiclab-proxy && \
+        > /etc/apt/apt.conf.d/80-topiclab-mirror && \
     apt-get update && apt-get install -y --no-install-recommends \
         bubblewrap socat ripgrep ca-certificates && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+    apt-get clean && rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/80-topiclab-mirror
 
-RUN npm config set fetch-retries 5 && \
+RUN npm config set registry "${NPM_REGISTRY}" && \
+    npm config set fetch-retries 5 && \
     npm config set fetch-retry-mintimeout 20000 && \
     npm config set fetch-retry-maxtimeout 120000 && \
     npm config set fetch-timeout 300000 && \
