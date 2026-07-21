@@ -1,4 +1,6 @@
 ARG PYTHON_BASE_IMAGE=python:3.11-slim
+ARG NODE_BASE_IMAGE=node:20-slim
+FROM ${NODE_BASE_IMAGE} AS node-runtime
 FROM ${PYTHON_BASE_IMAGE}
 
 ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/
@@ -11,21 +13,32 @@ RUN useradd -m -u 1000 appuser
 
 WORKDIR /app
 
-# 安装 sandbox-runtime (srt) 运行时依赖和 Node.js
+# 复用官方 Node 镜像中的运行时，避免通过 NodeSource 下载 Node.js。
+# 生产环境的代理链路较慢，大包下载容易长时间占满部署主机。
+COPY --from=node-runtime /usr/local/bin/node /usr/local/bin/node
+COPY --from=node-runtime /usr/local/lib/node_modules /usr/local/lib/node_modules
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    node --version && npm --version
+
+# 安装 sandbox-runtime (srt) 运行时依赖
 # srt 在 Linux 上需要: bubblewrap, socat, ripgrep
-# Node.js 用于运行 @anthropic-ai/sandbox-runtime CLI
-RUN apt-get update && apt-get install -y --no-install-recommends \
-        bubblewrap socat ripgrep curl ca-certificates gnupg \
-    && mkdir -p /etc/apt/keyrings \
-    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key \
-        | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
-    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_20.x nodistro main" \
-        > /etc/apt/sources.list.d/nodesource.list \
-    && apt-get update && apt-get install -y --no-install-recommends nodejs \
-    && npm install -g @anthropic-ai/sandbox-runtime \
-    && apt-get purge -y gnupg \
-    && apt-get autoremove -y \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN printf '%s\n' \
+        'Acquire::Retries "5";' \
+        'Acquire::http::Pipeline-Depth "0";' \
+        'Acquire::http::Timeout "30";' \
+        'Acquire::https::Timeout "30";' \
+        > /etc/apt/apt.conf.d/80-topiclab-proxy && \
+    apt-get update && apt-get install -y --no-install-recommends \
+        bubblewrap socat ripgrep ca-certificates && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN npm config set fetch-retries 5 && \
+    npm config set fetch-retry-mintimeout 20000 && \
+    npm config set fetch-retry-maxtimeout 120000 && \
+    npm config set fetch-timeout 300000 && \
+    npm install -g @anthropic-ai/sandbox-runtime && \
+    srt --version
 
 # 配置 pip 下载源；CI 和海外部署可通过 build args 切换到官方 PyPI。
 RUN mkdir -p /home/appuser/.pip && \
