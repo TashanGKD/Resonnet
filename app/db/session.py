@@ -26,6 +26,9 @@ def _backend_root() -> Path:
 
 def _build_engine() -> Engine:
     url = get_database_url()
+    # Keep the declared psycopg2 driver when SQLAlchemy's default changes.
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg2://" + url[len("postgresql://"):]
     kwargs: dict = {
         "pool_pre_ping": True,
         "future": True,

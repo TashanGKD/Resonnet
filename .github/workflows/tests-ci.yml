@@ -43,7 +43,7 @@ jobs:
             exit 0
           fi
           CHANGED=$(git diff --name-only "$BASE" HEAD 2>/dev/null || echo "")
-          if echo "$CHANGED" | grep -qE '^(app/api/|app/models/|app/core/|main\.py|tests/test_api\.py|tests/conftest\.py)'; then
+          if echo "$CHANGED" | grep -qE '^(app/api/|app/models/|app/core/|app/db/|main\.py|tests/test_api\.py|tests/test_database_driver\.py|tests/conftest\.py)'; then
             echo "run_api=true" >> "$GITHUB_OUTPUT"
           else
             echo "run_api=false" >> "$GITHUB_OUTPUT"
@@ -82,7 +82,7 @@ jobs:
             --with fastapi --with uvicorn --with pydantic --with pydantic-settings \
             --with python-dotenv --with claude-agent-sdk --with anthropic --with openai \
             --with pytest --with pytest-asyncio --with httpx \
-            pytest tests/test_api.py -v --tb=short
+            pytest tests/test_api.py tests/test_database_driver.py -v --tb=short
 
   unit-tests-agent-sdk:
     name: Unit (Agent SDK)
