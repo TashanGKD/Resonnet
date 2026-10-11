@@ -328,6 +328,7 @@ async def _execute_discussion(req, run_id, record):
 
     executor_runs.tasks[run_id] = discussion_task
     heartbeat = asyncio.create_task(executor_runs.heartbeat(record))
+    sync_task = None
     try:
         if req.topiclab_sync_url:
             sync_task = asyncio.create_task(
@@ -341,7 +342,9 @@ async def _execute_discussion(req, run_id, record):
             await discussion_task
     finally:
         heartbeat.cancel()
-        await asyncio.gather(heartbeat, return_exceptions=True)
+        if sync_task is not None:
+            sync_task.cancel()
+        await asyncio.gather(heartbeat, *([sync_task] if sync_task is not None else []), return_exceptions=True)
 
     result = discussion_task.result()
     result["turns"] = _read_turns(ws_path)

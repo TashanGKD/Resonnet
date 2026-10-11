@@ -40,7 +40,13 @@ def test_completed_executor_run_is_replayed_without_computation(monkeypatch, tmp
 
 def test_cancellation_stops_the_actual_task(monkeypatch, tmp_path):
     executor, records, app = setup_executor(monkeypatch, tmp_path)
-    started, stopped = threading.Event(), threading.Event()
+    started, stopped, sync_stopped = threading.Event(), threading.Event(), threading.Event()
+    async def sync(*args):
+        try:
+            await asyncio.sleep(30)
+        finally:
+            sync_stopped.set()
+    monkeypatch.setattr(executor, "_run_sync_loop_until_done", sync)
     async def compute(**kwargs):
         started.set()
         try:
@@ -51,11 +57,12 @@ def test_cancellation_stops_the_actual_task(monkeypatch, tmp_path):
     run_id = 'run_' + 'b' * 32
     with TestClient(app, headers={"X-TopicLab-Executor-Token":"test-service-token"}) as client, ThreadPoolExecutor() as pool:
         future = pool.submit(client.post, '/executor/discussions', json={
-            'run_id': run_id, 'topic_id': 'topic-2', 'topic_title': 'Title'})
+            'run_id': run_id, 'topic_id': 'topic-2', 'topic_title': 'Title', 'topiclab_sync_url':'http://account.test'})
         assert started.wait(3)
         cancelled = client.post(f'/executor/runs/{run_id}/cancel')
         assert cancelled.status_code == 200
         assert stopped.wait(3)
+        assert sync_stopped.wait(3)
         assert future.result(timeout=3).status_code == 409
         assert client.get(f'/executor/runs/{run_id}').json()['status'] == 'cancelled'
 
