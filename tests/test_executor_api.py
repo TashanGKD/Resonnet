@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 def test_executor_endpoints_work_without_database(monkeypatch, tmp_path):
     monkeypatch.setenv("RESONNET_MODE", "executor")
+    monkeypatch.setenv("TOPICLAB_EXECUTOR_TOKEN", "test-service-token")
     monkeypatch.delenv("TOPICDATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("WORKSPACE_BASE", str(tmp_path / "workspace"))
@@ -39,7 +40,7 @@ def test_executor_endpoints_work_without_database(monkeypatch, tmp_path):
     monkeypatch.setattr(executor_module, "run_expert_reply", fake_run_expert_reply)
     main_module = importlib.reload(main_module)
 
-    with TestClient(main_module.app) as client:
+    with TestClient(main_module.app, headers={"X-TopicLab-Executor-Token":"test-service-token"}) as client:
         bootstrap = client.post(
             "/executor/topics/bootstrap",
             json={"topic_id": "topic-1", "topic_title": "Title", "topic_body": "Body", "num_rounds": 1},
@@ -92,6 +93,7 @@ def test_executor_endpoints_work_without_database(monkeypatch, tmp_path):
 def test_bootstrap_with_ai_generated_roles(monkeypatch, tmp_path):
     """Bootstrap with use_ai_generated_roles creates workspace without default experts."""
     monkeypatch.setenv("RESONNET_MODE", "executor")
+    monkeypatch.setenv("TOPICLAB_EXECUTOR_TOKEN", "test-service-token")
     monkeypatch.delenv("TOPICDATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("WORKSPACE_BASE", str(tmp_path / "workspace"))
@@ -103,7 +105,7 @@ def test_bootstrap_with_ai_generated_roles(monkeypatch, tmp_path):
     import importlib
     import main as main_module
 
-    with TestClient(main_module.app) as client:
+    with TestClient(main_module.app, headers={"X-TopicLab-Executor-Token":"test-service-token"}) as client:
         bootstrap = client.post(
             "/executor/topics/bootstrap",
             json={
@@ -124,6 +126,7 @@ def test_bootstrap_with_ai_generated_roles(monkeypatch, tmp_path):
 def test_set_generated_experts(monkeypatch, tmp_path):
     """POST /executor/topics/{id}/experts/generated adds AI-generated experts."""
     monkeypatch.setenv("RESONNET_MODE", "executor")
+    monkeypatch.setenv("TOPICLAB_EXECUTOR_TOKEN", "test-service-token")
     monkeypatch.delenv("TOPICDATABASE_URL", raising=False)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     monkeypatch.setenv("WORKSPACE_BASE", str(tmp_path / "workspace"))
@@ -134,7 +137,7 @@ def test_set_generated_experts(monkeypatch, tmp_path):
 
     import main as main_module
 
-    with TestClient(main_module.app) as client:
+    with TestClient(main_module.app, headers={"X-TopicLab-Executor-Token":"test-service-token"}) as client:
         resp = client.post(
             f"/executor/topics/topic-gen-1/experts/generated",
             json={

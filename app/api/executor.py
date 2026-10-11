@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 from uuid import uuid4
 from app.api import executor_runs
 import logging
@@ -14,7 +15,7 @@ from urllib.parse import urljoin
 import re
 
 import httpx
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from app.agent.discussion import run_discussion_for_topic
@@ -32,7 +33,14 @@ from app.agent.workspace import (
 from app.core.config import get_workspace_base
 from app.core.topic_defaults import DEFAULT_TOPIC_EXPERT_NAMES, DEFAULT_TOPIC_SKILL_IDS
 
-router = APIRouter()
+def require_executor_service(x_topiclab_executor_token: str | None = Header(default=None)):
+    configured = os.getenv('TOPICLAB_EXECUTOR_TOKEN', '').strip()
+    if not configured:
+        raise HTTPException(503, 'Executor service authentication is not configured')
+    if not x_topiclab_executor_token or not secrets.compare_digest(configured, x_topiclab_executor_token):
+        raise HTTPException(401, 'Executor service authentication required')
+
+router = APIRouter(dependencies=[Depends(require_executor_service)])
 
 
 class ExecutorTopicBootstrapRequest(BaseModel):
@@ -170,8 +178,9 @@ async def _push_snapshot_to_topiclab(topic_id: str, sync_url: str, snapshot: dic
     url = urljoin(f"{sync_url.rstrip('/')}/", f"internal/discussion-snapshot/{topic_id}")
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            await client.post(
+            response = await client.post(
                 url,
+                headers={"X-TopicLab-Executor-Token": os.getenv("TOPICLAB_EXECUTOR_TOKEN", "")},
                 json={
                     "turns": snapshot.get("turns", []),
                     "turns_count": snapshot.get("turns_count", 0),
@@ -180,6 +189,7 @@ async def _push_snapshot_to_topiclab(topic_id: str, sync_url: str, snapshot: dic
                     "generated_images": snapshot.get("generated_images", []),
                 },
             )
+            response.raise_for_status()
         return True
     except Exception as e:
         logger.warning("Failed to push snapshot to TopicLab: %s", e)
