@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from uuid import uuid4
+from app.api import executor_runs
 import logging
 import os
 import shutil
@@ -12,7 +14,7 @@ from urllib.parse import urljoin
 import re
 
 import httpx
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from app.agent.discussion import run_discussion_for_topic
@@ -53,6 +55,7 @@ class ExecutorSetGeneratedExpertsRequest(BaseModel):
 
 
 class ExecutorDiscussionRequest(BaseModel):
+    run_id: str | None = Field(default=None, pattern=r"^run_[a-f0-9]{32}$")
     topic_id: str
     topic_title: str
     topic_body: str = ""
@@ -272,6 +275,28 @@ async def replace_generated_experts(topic_id: str, req: ExecutorSetGeneratedExpe
 
 @router.post("/discussions")
 async def run_discussion_executor(req: ExecutorDiscussionRequest):
+    run_id = req.run_id or 'run_' + uuid4().hex
+    record, created = executor_runs.reserve_run(run_id, req.model_dump())
+    if not created:
+        return record['result']
+    try:
+        result = await _execute_discussion(req, run_id, record)
+        record.update(status='completed', result=result)
+        executor_runs.write_record(record)
+        return result
+    except asyncio.CancelledError:
+        record.update(status='cancelled')
+        executor_runs.write_record(record)
+        raise HTTPException(409, detail={'code': 'run_cancelled', 'run_id': run_id})
+    except Exception:
+        record.update(status='failed', error_code='executor_failed')
+        executor_runs.write_record(record)
+        raise
+    finally:
+        executor_runs.tasks.pop(run_id, None)
+
+
+async def _execute_discussion(req, run_id, record):
     ws_path = ensure_topic_workspace(get_workspace_base(), req.topic_id)
     _write_posts_context(ws_path, req.posts_context)
 
@@ -291,16 +316,22 @@ async def run_discussion_executor(req: ExecutorDiscussionRequest):
         )
     )
 
-    if req.topiclab_sync_url:
-        sync_task = asyncio.create_task(
-            _run_sync_loop_until_done(req.topic_id, req.topiclab_sync_url, discussion_task)
-        )
-        await asyncio.gather(discussion_task, sync_task)
-        # Final push so TopicLab has latest state before we return
-        snapshot = _read_discussion_snapshot(req.topic_id)
-        await _push_snapshot_to_topiclab(req.topic_id, req.topiclab_sync_url, snapshot)
-    else:
-        await discussion_task
+    executor_runs.tasks[run_id] = discussion_task
+    heartbeat = asyncio.create_task(executor_runs.heartbeat(record))
+    try:
+        if req.topiclab_sync_url:
+            sync_task = asyncio.create_task(
+                _run_sync_loop_until_done(req.topic_id, req.topiclab_sync_url, discussion_task)
+            )
+            await asyncio.gather(discussion_task, sync_task)
+            # Final push so TopicLab has latest state before we return
+            snapshot = _read_discussion_snapshot(req.topic_id)
+            await _push_snapshot_to_topiclab(req.topic_id, req.topiclab_sync_url, snapshot)
+        else:
+            await discussion_task
+    finally:
+        heartbeat.cancel()
+        await asyncio.gather(heartbeat, return_exceptions=True)
 
     result = discussion_task.result()
     result["turns"] = _read_turns(ws_path)
@@ -334,3 +365,24 @@ async def run_expert_reply_executor(req: ExecutorExpertReplyRequest):
 @router.get("/discussions/{topic_id}/snapshot")
 async def get_discussion_snapshot(topic_id: str):
     return _read_discussion_snapshot(topic_id)
+
+
+@router.get('/runs/{run_id}')
+async def get_executor_run(run_id: str):
+    return executor_runs.read_record(run_id)
+
+
+@router.post('/runs/{run_id}/cancel')
+async def cancel_executor_run(run_id: str):
+    record = executor_runs.read_record(run_id)
+    if record['status'] in {'completed', 'cancelled', 'failed', 'interrupted'}:
+        return record
+    task = executor_runs.tasks.get(run_id)
+    if task is None:
+        raise HTTPException(409, detail={'code': 'run_owner_unavailable', 'run_id': run_id})
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+    record = executor_runs.read_record(run_id)
+    record['status'] = 'cancelled'
+    executor_runs.write_record(record)
+    return record
